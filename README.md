@@ -2,6 +2,8 @@ from telethon import TelegramClient, events
 import os
 import asyncio
 import traceback
+from flask import Flask
+from threading import Thread
 
 # API credentials for source chat
 source_api_id = 26697231  # Replace with your first API ID
@@ -74,8 +76,24 @@ async def main():
     print("Bot is running... Waiting for messages...")
     await handle_disconnection()  # Handle reconnections
 
+# Flask Keep-Alive Service
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running."
+
+# Function to run the Flask app in a separate thread
+def run_flask():
+    app.run(host='0.0.0.0', port=5000)  # Ensure the app runs on all interfaces
+
 # Entry point - running within the existing event loop
 if __name__ == "__main__":
+    # Start Flask in a separate thread to keep the app alive
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
     async def run_bot():
         while True:  # Loop to restart the script on error
             try:
