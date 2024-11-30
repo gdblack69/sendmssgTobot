@@ -1,3 +1,5 @@
+import subprocess
+import threading
 from telethon import TelegramClient, events
 import os
 import asyncio
@@ -5,61 +7,52 @@ import traceback
 from flask import Flask
 from threading import Thread
 
-# API credentials for source chat
-source_api_id = 26697231  # Replace with your first API ID
-source_api_hash = '35f2769c773534c6ebf24c9d0731703a'  # Replace with your first API Hash
-source_chat_id = -4564401074  # Replace with the chat ID to listen to
+# Keep-alive function (run the script in the background)
+def run_keep_alive():
+    subprocess.run(["python", "keep_alive.py"])
 
-# API credentials for destination account
-destination_api_id = 14135677  # Replace with your second API ID
-destination_api_hash = 'edbecdc187df07fddb10bcff89964a8e'  # Replace with your second API Hash
-destination_bot_username = '@gpt3_unlim_chatbot'  # Replace with the bot's username
+# Start the keep-alive script in a separate thread
+keep_alive_thread = threading.Thread(target=run_keep_alive)
+keep_alive_thread.daemon = True
+keep_alive_thread.start()
 
-# Paths for session files
+# Initialize Telegram clients (existing code continues here...)
+source_api_id = 26697231
+source_api_hash = '35f2769c773534c6ebf24c9d0731703a'
+source_chat_id = -4564401074
+
+destination_api_id = 14135677
+destination_api_hash = 'edbecdc187df07fddb10bcff89964a8e'
+destination_bot_username = '@gpt3_unlim_chatbot'
+
 source_session_file = "new10_source_session.session"
 destination_session_file = "new10_destination_session.session"
 
-# Ensure session files are present
 if not os.path.exists(source_session_file):
     print("Source session file not found. Creating a new session...")
 if not os.path.exists(destination_session_file):
     print("Destination session file not found. Creating a new session...")
 
-# Initialize Telegram clients
 source_client = TelegramClient(source_session_file, source_api_id, source_api_hash)
 destination_client = TelegramClient(destination_session_file, destination_api_id, destination_api_hash)
 
-# Function to handle disconnections and reconnections
 async def handle_disconnection():
     while True:
         try:
             await source_client.run_until_disconnected()
         except Exception as e:
             print(f"Error: {e}. Reconnecting...")
-            await asyncio.sleep(5)  # Wait before attempting to reconnect
-            await source_client.start()  # Restart the client
+            await asyncio.sleep(5)
+            await source_client.start()
 
-# Event handler for messages in the source chat
 @source_client.on(events.NewMessage(chats=source_chat_id))
 async def forward_message(event):
-    # Extract the original message
     source_id_message = event.raw_text
 
-    # Custom message format with highlighted source message
     custom_message = f"""
-"{source_id_message}"
- 
- If the quoted text within double quotation mark is not a trading signal, respond with "Processing your question....". If it is a trading signal, extract the necessary information and fill out the form below. The symbol should be paired with USDT. Use the highest entry price. The stop loss price will be taken from inside the double quotation mark and if it is not given then calculate it as 0.5% below the entry price. Use the lowest take profit price given inside the double quoted message and if none is provided then calculate take profit price as 2% above the entry price.Provide only the completed form, no other text.[Remember inside the double quotation mark 'cmp'= current market price, 'sl'= stop loss, 'tp'=take profit]
+    "{source_id_message}"
+    """
 
-
-Symbol:
-Price:
-Stop Loss:
-Take Profit:
-Take Profit:
-"""
-
-    # Send the formatted message to the bot
     async with destination_client:
         try:
             await destination_client.send_message(destination_bot_username, custom_message)
@@ -67,41 +60,20 @@ Take Profit:
         except Exception as e:
             print(f"Error while forwarding the message: {e}")
 
-# Main function to start both clients
 async def main():
     print("Starting both clients...")
-    # Start both clients
     await source_client.start()
     await destination_client.start()
     print("Bot is running... Waiting for messages...")
-    await handle_disconnection()  # Handle reconnections
+    await handle_disconnection()
 
-# Flask Keep-Alive Service
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running."
-
-# Function to run the Flask app in a separate thread
-def run_flask():
-    app.run(host='0.0.0.0', port=5000)  # Ensure the app runs on all interfaces
-
-# Entry point - running within the existing event loop
 if __name__ == "__main__":
-    # Start Flask in a separate thread to keep the app alive
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
     async def run_bot():
-        while True:  # Loop to restart the script on error
+        while True:
             try:
-                # Run the main function within the existing event loop
                 await main()
             except Exception as e:
                 print(f"Error occurred: {e}. Restarting the script...")
-                await asyncio.sleep(5)  # Optional sleep to prevent rapid restarts
+                await asyncio.sleep(5)
 
-    # Start the event loop to run the bot
     asyncio.run(run_bot())
