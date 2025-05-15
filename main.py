@@ -67,21 +67,31 @@ async def forward_message(event):
     custom_message = f"""
 "{message}"
  
-If the text inside the double quotation marks is not a trading signal or indicates a short/sell, respond with:
+If the text inside double quotes is not a trading signal or says to short/sell, reply with:
 👉 "No it's not your call"
 
-If it is a long/buy trading signal, extract the necessary details and fill in the form below:
+If it's a buy/long signal, extract the details and fill the form like this:
 
-Symbol: Pair with USDT (without using /).
+Symbol: Use the coin name with 'USDT' (without '/').
 
-Price: Use the highest entry price.
+Price: Take the highest entry price.
 
-Stop Loss: If given inside the quotation marks, use it; otherwise, calculate it as 0.5% below the entry price.
+If it says 'buy at cmp', take the CMP given and add 10% as the price in the form.
 
-Take Profit: If provided, use the lowest take profit price; otherwise, calculate it as 2% above the entry price.
+Stop Loss (SL): If given, use that.
+If not given, calculate 1.88% below the entry price.
 
-🔹 Output only the completed form—no extra text.
-💡 Note: Inside the quotation marks, 'cmp' refers to the current market price, 'sl' is the stop loss, and 'tp' is the take profit.
+Take Profit (TP): If given, use the lowest TP price.
+If not given, calculate 2% above the entry price.
+
+🔹 Output only the filled form, no extra text.
+
+💡 Notes: 'cmp' = current market price
+           'sl' = stop loss
+           'tp' = take profit
+
+If the text says 'buy at cmp', use CMP for SL and TP as per message (or calculate if not given). But 
+always show the price in the form as 10% higher than CMP.
 """
     try:
         await destination_client.send_message(DESTINATION_BOT_USERNAME, custom_message)
