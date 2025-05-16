@@ -6,15 +6,15 @@ from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from threading import Thread
 
 # === CONFIG ===
-SOURCE_API_ID = int(os.environ.get('SOURCE_API_ID', '26697231'))
-SOURCE_API_HASH = os.environ.get('SOURCE_API_HASH', '35f2769c773534c6ebf24c9d0731703a')
-SOURCE_PHONE_NUMBER = os.environ.get('SOURCE_PHONE_NUMBER', '+919598293175')
-SOURCE_CHAT_ID = int(os.environ.get('SOURCE_CHAT_ID', '-1002256615512'))
+SOURCE_API_ID = os.environ.get('SOURCE_API_ID')
+SOURCE_API_HASH = os.environ.get('SOURCE_API_HASH')
+SOURCE_PHONE_NUMBER = os.environ.get('SOURCE_PHONE_NUMBER')
+SOURCE_CHAT_ID = os.environ.get('SOURCE_CHAT_ID')
 
-DESTINATION_API_ID = int(os.environ.get('DESTINATION_API_ID', '14135677')]
-DESTINATION_API_HASH = os.environ.get('DESTINATION_API_HASH', 'edbecdc187df07fddb10bcff89964a8e')
-DESTINATION_PHONE_NUMBER = os.environ.get('DESTINATION_PHONE_NUMBER', '+917897293175')
-DESTINATION_BOT_USERNAME = os.environ.get('DESTINATION_BOT_USERNAME', '@gpt3_unlim_chatbot')
+DESTINATION_API_ID = os.environ.get('DESTINATION_API_ID')
+DESTINATION_API_HASH = os.environ.get('DESTINATION_API_HASH')
+DESTINATION_PHONE_NUMBER = os.environ.get('DESTINATION_PHONE_NUMBER')
+DESTINATION_BOT_USERNAME = os.environ.get('DESTINATION_BOT_USERNAME')
 
 SESSION_DIR = "/opt/render/project/src"
 SOURCE_SESSION_FILE = os.path.join(SESSION_DIR, "source_session.session")
@@ -22,6 +22,29 @@ DESTINATION_SESSION_FILE = os.path.join(SESSION_DIR, "destination_session.sessio
 
 otp_data = {'source': None, 'destination': None}
 otp_request_sent = {'source': False, 'destination': False}
+
+# Validate environment variables
+required_vars = {
+    'SOURCE_API_ID': SOURCE_API_ID,
+    'SOURCE_API_HASH': SOURCE_API_HASH,
+    'SOURCE_PHONE_NUMBER': SOURCE_PHONE_NUMBER,
+    'SOURCE_CHAT_ID': SOURCE_CHAT_ID,
+    'DESTINATION_API_ID': DESTINATION_API_ID,
+    'DESTINATION_API_HASH': DESTINATION_API_HASH,
+    'DESTINATION_PHONE_NUMBER': DESTINATION_PHONE_NUMBER,
+    'DESTINATION_BOT_USERNAME': DESTINATION_BOT_USERNAME
+}
+missing_vars = [key for key, value in required_vars.items() if not value]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+# Convert to appropriate types
+try:
+    SOURCE_API_ID = int(SOURCE_API_ID)
+    SOURCE_CHAT_ID = int(SOURCE_CHAT_ID)
+    DESTINATION_API_ID = int(DESTINATION_API_ID)
+except ValueError as e:
+    raise ValueError("Environment variables SOURCE_API_ID, SOURCE_CHAT_ID, and DESTINATION_API_ID must be valid integers") from e
 
 # === TELEGRAM CLIENTS ===
 source_client = TelegramClient(SOURCE_SESSION_FILE, SOURCE_API_ID, SOURCE_API_HASH)
