@@ -1,11 +1,13 @@
 import os
 import asyncio
+import socket
+import traceback
 from flask import Flask, request, jsonify
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from threading import Thread
 import b2sdk.v2 as b2
-from b2sdk.v2.exception import B2Error
+from b2sdk.v2.exception import B2Error, FileNotPresent
 
 # === CONFIG ===
 SOURCE_API_ID = os.environ.get('SOURCE_API_ID')
@@ -65,12 +67,27 @@ def init_b2_client():
 
 def download_session_file(b2_api, bucket, session_file, remote_path):
     try:
+        # Check if file exists in bucket
+        file_info = bucket.get_file_info_by_name(remote_path)
+        if not file_info:
+            print(f"No session file found in B2 at {remote_path}")
+            return False
+            
         if os.path.exists(session_file):
             print(f"Local session file {session_file} already exists, skipping download.")
             return True
+            
         bucket.download_file_by_name(remote_path, b2.File(session_file))
         print(f"Downloaded {remote_path} to {session_file}")
-        return True
+        if os.path.exists(session_file):
+            print(f"Confirmed {session_file} exists locally after download.")
+            return True
+        else:
+            print(f"Error: {session_file} not found locally after download attempt.")
+            return False
+    except FileNotPresent:
+        print(f"Session file {remote_path} does not exist in B2 bucket.")
+        return False
     except B2Error as e:
         print(f"Error downloading {remote_path}: {str(e)}")
         return False
@@ -120,42 +137,63 @@ def receive_otp():
 async def login_with_phone(client, phone_number, account_type, b2_api, bucket, session_file, remote_path):
     try:
         await client.connect()
-        if not await client.is_user_authorized():
-            if not otp_request_sent[account_type]:
-                print(f"Initiating login for {account_type} account...")
-                try:
-                    await client.send_code_request(phone_number)
-                    otp_request_sent[account_type] = True
-                    print(f"OTP request sent successfully to {phone_number} for {account_type} account.")
-                except FloodWaitError as e:
-                    print(f"Error: Too many requests for {account_type} account. Please wait {e.seconds} seconds before trying again.")
-                    return False
-                except Exception as e:
-                    print(f"Error sending OTP request for {account_type} account: {str(e)}")
-                    return False
-            
-            print(f"Waiting for OTP for {account_type} account...")
-            while otp_data[account_type] is None:
-                await asyncio.sleep(1)
-            
+        # Check if session file exists and is valid
+        if os.path.exists(session_file):
+            print(f"Session file {session_file} found, checking validity...")
             try:
-                await client.sign_in(phone_number, otp_data[account_type])
-                print(f"Login successful for {account_type} account.")
-                # Upload session file after successful login
-                upload_session_file(b2_api, bucket, session_file, remote_path)
-                return True
-            except SessionPasswordNeededError:
-                print(f"Error: Two-factor authentication is enabled for {account_type} account. Password login is not supported.")
+                if await client.is_user_authorized():
+                    print(f"{account_type.capitalize()} account is already authorized.")
+                    return True
+                else:
+                    print(f"Session file {session_file} is invalid or expired.")
+                    os.remove(session_file)  # Remove invalid session file
+            except Exception as e:
+                print(f"Error validating session file {session_file}: {str(e)}\n{traceback.format_exc()}")
+                os.remove(session_file)  # Remove invalid session file
+        else:
+            print(f"No session file found locally at {session_file}")
+
+        # Proceed with OTP login if not authorized
+        if not otp_request_sent[account_type]:
+            print(f"Initiating login for {account_type} account...")
+            try:
+                await client.send_code_request(phone_number)
+                otp_request_sent[account_type] = True
+                print(f"OTP request sent successfully to {phone_number} for {account_type} account.")
+            except FloodWaitError as e:
+                print(f"Error: Too many requests for {account_type} account. Please wait {e.seconds} seconds.")
                 return False
             except Exception as e:
-                print(f"Error: Invalid OTP for {account_type} account. Please check the code and try again. Details: {str(e)}")
-                otp_data[account_type] = None  # Reset OTP to allow retry
+                print(f"Error sending OTP request for {account_type} account: {str(e)}\n{traceback.format_exc()}")
                 return False
-        else:
-            print(f"{account_type.capitalize()} account is already authorized.")
+        
+        print(f"Waiting for OTP for {account_type} account...")
+        timeout = 60  # Wait up to 60 seconds for OTP
+        start_time = asyncio.get_event_loop().time()
+        while otp_data[account_type] is None:
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                print(f"Timeout waiting for OTP for {account_type} account.")
+                return False
+            await asyncio.sleep(1)
+        
+        try:
+            await client.sign_in(phone_number, otp_data[account_type])
+            print(f"Login successful for {account_type} account.")
+            # Upload session file after successful login
+            if upload_session_file(b2_api, bucket, session_file, remote_path):
+                print(f"Session file uploaded to B2 for {account_type} account.")
+            else:
+                print(f"Failed to upload session file for {account_type} account.")
             return True
+        except SessionPasswordNeededError:
+            print(f"Error: Two-factor authentication enabled for {account_type} account.")
+            return False
+        except Exception as e:
+            print(f"Error: Invalid OTP for {account_type} account: {str(e)}\n{traceback.format_exc()}")
+            otp_data[account_type] = None
+            return False
     except Exception as e:
-        print(f"Unexpected error during login for {account_type} account: {str(e)}")
+        print(f"Unexpected error during login for {account_type} account: {str(e)}\n{traceback.format_exc()}")
         return False
 
 # === TELEGRAM EVENT HANDLER ===
@@ -174,10 +212,12 @@ Symbol: Use the coin name with 'USDT' (without '/').
 
 Price: Take the highest entry price.
 
-Stop Loss: If given, use that.
+If it says 'buy at cmp', take the CMP given and add 10% as the price in the form.
+
+Stop Loss (SL): If given, use that.
 If not given, calculate 1.88% below the entry price.
 
-Take Profit: If given, use the lowest TP price.
+Take Profit (TP): If given, use the lowest TP price.
 If not given, calculate 2% above the entry price.
 
 🔹 Output only the filled form, no extra text.
@@ -185,29 +225,30 @@ If not given, calculate 2% above the entry price.
 💡 Notes: 'cmp' = current market price
            'sl' = stop loss
            'tp' = take profit
+
+If the text says 'buy at cmp', use CMP for SL and TP as per message (or calculate if not given). But 
+always show the price in the form as 10% higher than CMP.
 """
     try:
         await destination_client.send_message(DESTINATION_BOT_USERNAME, custom_message)
         print("Message forwarded successfully to destination bot.")
     except Exception as e:
-        print(f"Error forwarding message to destination bot: {str(e)}")
+        print(f"Error forwarding message to destination bot: {str(e)}\n{traceback.format_exc()}")
 
 # === MAIN FUNCTION ===
 async def start_bot():
-    print("Starting Telegram bot...")
+    print(f"Starting Telegram bot at {socket.gethostbyname(socket.gethostname())}...")
     
-    # Initialize Backblaze B2
     try:
         b2_api, bucket = init_b2_client()
+        print("Backblaze B2 initialized successfully.")
     except B2Error as e:
-        print(f"Failed to initialize Backblaze B2: {str(e)}")
+        print(f"Failed to initialize Backblaze B2: {str(e)}\n{traceback.format_exc()}")
         return
 
-    # Download session files if they exist
     source_session_downloaded = download_session_file(b2_api, bucket, SOURCE_SESSION_FILE, "source_session.session")
     destination_session_downloaded = download_session_file(b2_api, bucket, DESTINATION_SESSION_FILE, "destination_session.session")
 
-    # Proceed with login
     source_success = await login_with_phone(
         source_client, SOURCE_PHONE_NUMBER, 'source', b2_api, bucket, 
         SOURCE_SESSION_FILE, "source_session.session"
@@ -224,8 +265,15 @@ async def start_bot():
         print("Failed to log in to destination account. Bot cannot proceed.")
         return
     
+    # Verify both clients are fully authenticated
     await source_client.start()
+    if not await source_client.is_user_authorized():
+        print("Source client failed post-start authorization check.")
+        return
     await destination_client.start()
+    if not await destination_client.is_user_authorized():
+        print("Destination client failed post-start authorization check.")
+        return
     print("Both Telegram clients are running successfully.")
     
     await source_client.run_until_disconnected()
