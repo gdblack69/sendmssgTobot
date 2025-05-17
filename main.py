@@ -24,9 +24,13 @@ B2_KEY_ID = os.environ.get('B2_KEY_ID')
 B2_APPLICATION_KEY = os.environ.get('B2_APPLICATION_KEY')
 B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
 
+# Session names from environment variables
+SOURCE_SESSION_NAME = os.environ.get('SOURCE_SESSION_NAME', 'source_session')
+DESTINATION_SESSION_NAME = os.environ.get('DESTINATION_SESSION_NAME', 'destination_session')
+
 SESSION_DIR = "/opt/render/project/src"
-SOURCE_SESSION_FILE = os.path.join(SESSION_DIR, "source_session.session")
-DESTINATION_SESSION_FILE = os.path.join(SESSION_DIR, "destination_session.session")
+SOURCE_SESSION_FILE = os.path.join(SESSION_DIR, f"{SOURCE_SESSION_NAME}.session")
+DESTINATION_SESSION_FILE = os.path.join(SESSION_DIR, f"{DESTINATION_SESSION_NAME}.session")
 
 otp_data = {'source': None, 'destination': None}
 otp_request_sent = {'source': False, 'destination': False}
@@ -56,6 +60,17 @@ try:
     DESTINATION_API_ID = int(DESTINATION_API_ID)
 except ValueError as e:
     raise ValueError("Environment variables SOURCE_API_ID, SOURCE_CHAT_ID, and DESTINATION_API_ID must be valid integers") from e
+
+# Ensure session directory exists and is writable
+if not os.path.exists(SESSION_DIR):
+    try:
+        os.makedirs(SESSION_DIR)
+        print(f"Created session directory: {SESSION_DIR}")
+    except Exception as e:
+        print(f"Error creating session directory {SESSION_DIR}: {str(e)}\n{traceback.format_exc()}")
+        raise
+if not os.access(SESSION_DIR, os.W_OK):
+    raise PermissionError(f"Session directory {SESSION_DIR} is not writable")
 
 # === BACKBLAZE B2 SETUP ===
 def init_b2_client():
@@ -89,7 +104,7 @@ def download_session_file(b2_api, bucket, session_file, remote_path):
         print(f"Session file {remote_path} does not exist in B2 bucket.")
         return False
     except B2Error as e:
-        print(f"Error downloading {remote_path}: {str(e)}")
+        print(f"Error downloading {remote_path}: {str(e)}\n{traceback.format_exc()}")
         return False
 
 def upload_session_file(b2_api, bucket, session_file, remote_path):
@@ -97,20 +112,23 @@ def upload_session_file(b2_api, bucket, session_file, remote_path):
         if not os.path.exists(session_file):
             print(f"Session file {session_file} does not exist, cannot upload.")
             return False
+        file_size = os.path.getsize(session_file)
+        print(f"Uploading {session_file} (size: {file_size} bytes) to {remote_path}")
         bucket.upload_local_file(
             local_file=session_file,
             file_name=remote_path,
             file_infos={"uploaded_by": "telegram-bot"}
         )
-        print(f"Uploaded {session_file} to {remote_path}")
+        print(f"Successfully uploaded {session_file} to {remote_path}")
         return True
     except B2Error as e:
-        print(f"Error uploading {remote_path}: {str(e)}")
+        print(f"Error uploading {remote_path}: {str(e)}\n{traceback.format_exc()}")
         return False
 
 # === TELEGRAM CLIENTS ===
-source_client = TelegramClient(SOURCE_SESSION_FILE, SOURCE_API_ID, SOURCE_API_HASH)
-destination_client = TelegramClient(DESTINATION_SESSION_FILE, DESTINATION_API_ID, DESTINATION_API_HASH)
+# Use session names without the .session extension
+source_client = TelegramClient(SOURCE_SESSION_NAME, SOURCE_API_ID, SOURCE_API_HASH)
+destination_client = TelegramClient(DESTINATION_SESSION_NAME, DESTINATION_API_ID, DESTINATION_API_HASH)
 
 # === FLASK APP ===
 app = Flask(__name__)
@@ -143,6 +161,11 @@ async def login_with_phone(client, phone_number, account_type, b2_api, bucket, s
             try:
                 if await client.is_user_authorized():
                     print(f"{account_type.capitalize()} account is already authorized.")
+                    # Upload session file to ensure it's in B2
+                    if upload_session_file(b2_api, bucket, session_file, remote_path):
+                        print(f"Session file re-uploaded to B2 for {account_type} account.")
+                    else:
+                        print(f"Failed to re-upload session file for {account_type} account.")
                     return True
                 else:
                     print(f"Session file {session_file} is invalid or expired.")
@@ -179,11 +202,16 @@ async def login_with_phone(client, phone_number, account_type, b2_api, bucket, s
         try:
             await client.sign_in(phone_number, otp_data[account_type])
             print(f"Login successful for {account_type} account.")
+            # Ensure session file exists after login
+            if not os.path.exists(session_file):
+                print(f"Error: Session file {session_file} not created after login.")
+                return False
             # Upload session file after successful login
             if upload_session_file(b2_api, bucket, session_file, remote_path):
                 print(f"Session file uploaded to B2 for {account_type} account.")
             else:
                 print(f"Failed to upload session file for {account_type} account.")
+                return False
             return True
         except SessionPasswordNeededError:
             print(f"Error: Two-factor authentication enabled for {account_type} account.")
@@ -246,12 +274,13 @@ async def start_bot():
         print(f"Failed to initialize Backblaze B2: {str(e)}\n{traceback.format_exc()}")
         return
 
-    source_session_downloaded = download_session_file(b2_api, bucket, SOURCE_SESSION_FILE, "source_session.session")
-    destination_session_downloaded = download_session_file(b2_api, bucket, DESTINATION_SESSION_FILE, "destination_session.session")
+    # Use session names for remote paths to maintain consistency
+    source_session_downloaded = download_session_file(b2_api, bucket, SOURCE_SESSION_FILE, f"{SOURCE_SESSION_NAME}.session")
+    destination_session_downloaded = download_session_file(b2_api, bucket, DESTINATION_SESSION_FILE, f"{DESTINATION_SESSION_NAME}.session")
 
     source_success = await login_with_phone(
         source_client, SOURCE_PHONE_NUMBER, 'source', b2_api, bucket, 
-        SOURCE_SESSION_FILE, "source_session.session"
+        SOURCE_SESSION_FILE, f"{SOURCE_SESSION_NAME}.session"
     )
     if not source_success:
         print("Failed to log in to source account. Bot cannot proceed.")
@@ -259,7 +288,7 @@ async def start_bot():
     
     destination_success = await login_with_phone(
         destination_client, DESTINATION_PHONE_NUMBER, 'destination', b2_api, bucket, 
-        DESTINATION_SESSION_FILE, "destination_session.session"
+        DESTINATION_SESSION_FILE, f"{DESTINATION_SESSION_NAME}.session"
     )
     if not destination_success:
         print("Failed to log in to destination account. Bot cannot proceed.")
