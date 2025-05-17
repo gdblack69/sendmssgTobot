@@ -1,319 +1,222 @@
-import os
+import logging
+import math
 import asyncio
-import socket
 import traceback
 from flask import Flask, request, jsonify
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
-from threading import Thread
-import b2sdk.v2 as b2
-from b2sdk.v2.exception import B2Error, FileNotPresent
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError
+from pybit.unified_trading import HTTP
+from dotenv import load_dotenv
+import os
+import time
+from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
-# === CONFIG ===
-SOURCE_API_ID = os.environ.get('SOURCE_API_ID')
-SOURCE_API_HASH = os.environ.get('SOURCE_API_HASH')
-SOURCE_PHONE_NUMBER = os.environ.get('SOURCE_PHONE_NUMBER')
-SOURCE_CHAT_ID = os.environ.get('SOURCE_CHAT_ID')
-
-DESTINATION_API_ID = os.environ.get('DESTINATION_API_ID')
-DESTINATION_API_HASH = os.environ.get('DESTINATION_API_HASH')
-DESTINATION_PHONE_NUMBER = os.environ.get('DESTINATION_PHONE_NUMBER')
-DESTINATION_BOT_USERNAME = os.environ.get('DESTINATION_BOT_USERNAME')
-
-B2_KEY_ID = os.environ.get('B2_KEY_ID')
-B2_APPLICATION_KEY = os.environ.get('B2_APPLICATION_KEY')
-B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
-
-# Session names from environment variables
-SOURCE_SESSION_NAME = os.environ.get('SOURCE_SESSION_NAME', 'source_session')
-DESTINATION_SESSION_NAME = os.environ.get('DESTINATION_SESSION_NAME', 'destination_session')
-
-SESSION_DIR = "/opt/render/project/src"
-SOURCE_SESSION_FILE = os.path.join(SESSION_DIR, f"{SOURCE_SESSION_NAME}.session")
-DESTINATION_SESSION_FILE = os.path.join(SESSION_DIR, f"{DESTINATION_SESSION_NAME}.session")
-
-otp_data = {'source': None, 'destination': None}
-otp_request_sent = {'source': False, 'destination': False}
-
-# Validate environment variables
-required_vars = {
-    'SOURCE_API_ID': SOURCE_API_ID,
-    'SOURCE_API_HASH': SOURCE_API_HASH,
-    'SOURCE_PHONE_NUMBER': SOURCE_PHONE_NUMBER,
-    'SOURCE_CHAT_ID': SOURCE_CHAT_ID,
-    'DESTINATION_API_ID': DESTINATION_API_ID,
-    'DESTINATION_API_HASH': DESTINATION_API_HASH,
-    'DESTINATION_PHONE_NUMBER': DESTINATION_PHONE_NUMBER,
-    'DESTINATION_BOT_USERNAME': DESTINATION_BOT_USERNAME,
-    'B2_KEY_ID': B2_KEY_ID,
-    'B2_APPLICATION_KEY': B2_APPLICATION_KEY,
-    'B2_BUCKET_NAME': B2_BUCKET_NAME
-}
-missing_vars = [key for key, value in required_vars.items() if not value]
-if missing_vars:
-    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-
-# Convert to appropriate types
-try:
-    SOURCE_API_ID = int(SOURCE_API_ID)
-    SOURCE_CHAT_ID = int(SOURCE_CHAT_ID)
-    DESTINATION_API_ID = int(DESTINATION_API_ID)
-except ValueError as e:
-    raise ValueError("Environment variables SOURCE_API_ID, SOURCE_CHAT_ID, and DESTINATION_API_ID must be valid integers") from e
-
-# Ensure session directory exists and is writable
-if not os.path.exists(SESSION_DIR):
-    try:
-        os.makedirs(SESSION_DIR)
-        print(f"Created session directory: {SESSION_DIR}")
-    except Exception as e:
-        print(f"Error creating session directory {SESSION_DIR}: {str(e)}\n{traceback.format_exc()}")
-        raise
-if not os.access(SESSION_DIR, os.W_OK):
-    raise PermissionError(f"Session directory {SESSION_DIR} is not writable")
-
-# === BACKBLAZE B2 SETUP ===
-def init_b2_client():
-    info = b2.InMemoryAccountInfo()
-    b2_api = b2.B2Api(info)
-    b2_api.authorize_account("production", B2_KEY_ID, B2_APPLICATION_KEY)
-    bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
-    return b2_api, bucket
-
-def download_session_file(b2_api, bucket, session_file, remote_path):
-    try:
-        # Check if file exists in bucket
-        file_info = bucket.get_file_info_by_name(remote_path)
-        if not file_info:
-            print(f"No session file found in B2 at {remote_path}")
-            return False
-            
-        if os.path.exists(session_file):
-            print(f"Local session file {session_file} already exists, skipping download.")
-            return True
-            
-        bucket.download_file_by_name(remote_path, b2.File(session_file))
-        print(f"Downloaded {remote_path} to {session_file}")
-        if os.path.exists(session_file):
-            print(f"Confirmed {session_file} exists locally after download.")
-            return True
-        else:
-            print(f"Error: {session_file} not found locally after download attempt.")
-            return False
-    except FileNotPresent:
-        print(f"Session file {remote_path} does not exist in B2 bucket.")
-        return False
-    except B2Error as e:
-        print(f"Error downloading {remote_path}: {str(e)}\n{traceback.format_exc()}")
-        return False
-
-def upload_session_file(b2_api, bucket, session_file, remote_path):
-    try:
-        if not os.path.exists(session_file):
-            print(f"Session file {session_file} does not exist, cannot upload.")
-            return False
-        file_size = os.path.getsize(session_file)
-        print(f"Uploading {session_file} (size: {file_size} bytes) to {remote_path}")
-        bucket.upload_local_file(
-            local_file=session_file,
-            file_name=remote_path,
-            file_infos={"uploaded_by": "telegram-bot"}
-        )
-        print(f"Successfully uploaded {session_file} to {remote_path}")
-        return True
-    except B2Error as e:
-        print(f"Error uploading {remote_path}: {str(e)}\n{traceback.format_exc()}")
-        return False
-
-# === TELEGRAM CLIENTS ===
-# Use session names without the .session extension
-source_client = TelegramClient(SOURCE_SESSION_NAME, SOURCE_API_ID, SOURCE_API_HASH)
-destination_client = TelegramClient(DESTINATION_SESSION_NAME, DESTINATION_API_ID, DESTINATION_API_HASH)
-
-# === FLASK APP ===
+# Initialize Flask app
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "Telegram Bot is running. Use /receive_otp to send OTPs."
+# Logging configuration
+logging.basicConfig(
+    filename='pybit_telegram.log',
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
 
-@app.route('/receive_otp', methods=['POST'])
-def receive_otp():
-    data = request.json
-    account_type = data.get('account_type')
-    otp = data.get('otp')
-    
-    if account_type not in otp_data:
-        print(f"Error: Invalid account type '{account_type}' received.")
-        return jsonify({"error": "Invalid account type. Must be 'source' or 'destination'."}), 400
-    
-    print(f"OTP received for {account_type} account: {otp}")
-    otp_data[account_type] = otp
-    return jsonify({"status": "OTP received successfully", "account": account_type}), 200
+# Load environment variables from .env file
+load_dotenv()
 
-# === LOGIN HANDLER ===
-async def login_with_phone(client, phone_number, account_type, b2_api, bucket, session_file, remote_path):
+# Configuration variables
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER")
+SESSION_NAME = os.getenv("SESSION_NAME")
+SESSION_FILENAME = os.getenv("SESSION_FILENAME", f"{SESSION_NAME}.session")
+
+# B2 config
+B2_KEY_ID = os.getenv("B2_KEY_ID")
+B2_APP_KEY = os.getenv("B2_APP_KEY")
+B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
+
+# Initialize Bybit session
+session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=False, demo=True)
+
+# Initialize Telegram client
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+# OTP control
+otp_received = None
+login_event = asyncio.Event()
+last_otp_request_time = 0
+OTP_REQUEST_INTERVAL = 60
+
+# ------------------ B2 Functions ------------------
+def init_b2_api():
+    info = InMemoryAccountInfo()
+    b2_api = B2Api(info)
+    b2_api.authorize_account("production", B2_KEY_ID, B2_APP_KEY)
+    return b2_api
+
+def download_session_file_from_b2():
     try:
-        await client.connect()
-        # Check if session file exists and is valid
-        if os.path.exists(session_file):
-            print(f"Session file {session_file} found, checking validity...")
-            try:
-                if await client.is_user_authorized():
-                    print(f"{account_type.capitalize()} account is already authorized.")
-                    # Upload session file to ensure it's in B2
-                    if upload_session_file(b2_api, bucket, session_file, remote_path):
-                        print(f"Session file re-uploaded to B2 for {account_type} account.")
-                    else:
-                        print(f"Failed to re-upload session file for {account_type} account.")
-                    return True
-                else:
-                    print(f"Session file {session_file} is invalid or expired.")
-                    os.remove(session_file)  # Remove invalid session file
-            except Exception as e:
-                print(f"Error validating session file {session_file}: {str(e)}\n{traceback.format_exc()}")
-                os.remove(session_file)  # Remove invalid session file
+        b2_api = init_b2_api()
+        bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
+        file_info = bucket.get_file_info_by_name(SESSION_FILENAME)
+        if file_info:
+            with open(SESSION_FILENAME, "wb") as f:
+                bucket.download_file_by_name(SESSION_FILENAME).save_to(f)
+            logging.info("Downloaded session file from B2.")
+    except Exception as e:
+        logging.warning("Session download skipped: %s", e)
+
+def upload_session_file_to_b2():
+    try:
+        if not os.path.exists(SESSION_FILENAME):
+            logging.warning("Session file missing locally: %s", SESSION_FILENAME)
+            return
+        b2_api = init_b2_api()
+        bucket = b2_api.get_bucket_by_name(B2_BUCKET_NAME)
+        with open(SESSION_FILENAME, "rb") as f:
+            bucket.upload_bytes(f.read(), SESSION_FILENAME)
+        logging.info("Uploaded session file to B2.")
+    except Exception as e:
+        logging.error("Session upload failed: %s", traceback.format_exc())
+
+# ------------------ Business Logic ------------------
+
+def get_step_size(symbol):
+    try:
+        instruments = session.get_instruments_info(category="linear")
+        linear_list = instruments["result"]["list"]
+        symbol_info = next((x for x in linear_list if x["symbol"] == symbol), None)
+        if symbol_info:
+            return float(symbol_info["lotSizeFilter"]["qtyStep"])
         else:
-            print(f"No session file found locally at {session_file}")
+            raise ValueError(f"Symbol {symbol} not found")
+    except Exception:
+        logging.error("Step size error: %s", traceback.format_exc())
+        raise
 
-        # Proceed with OTP login if not authorized
-        if not otp_request_sent[account_type]:
-            print(f"Initiating login for {account_type} account...")
+def format_trade_details(symbol, price, stop_loss_price, take_profit_price, qty, order_response, equity, wallet_balance):
+    order_id = order_response.get("result", {}).get("orderId", "N/A")
+    ret_msg = order_response.get("retMsg", "N/A")
+    timestamp = order_response.get("time", "N/A")
+    trade_info = "\n===== Trade Details =====\n"
+    trade_info += f"{'Symbol':<20}: {symbol}\n"
+    trade_info += f"{'Price':<20}: {price:,.2f}\n"
+    trade_info += f"{'Stop Loss':<20}: {stop_loss_price:,.2f}\n"
+    trade_info += f"{'Take Profit':<20}: {take_profit_price:,.2f}\n"
+    trade_info += f"{'Quantity':<20}: {qty:,.8f}\n"
+    trade_info += f"{'Order ID':<20}: {order_id}\n"
+    trade_info += f"{'Status':<20}: {ret_msg}\n"
+    trade_info += f"{'Timestamp':<20}: {timestamp}\n"
+    trade_info += f"{'USDT Equity':<20}: {equity:,.2f}\n"
+    trade_info += f"{'Wallet Balance':<20}: {wallet_balance:,.2f}\n"
+    trade_info += "========================\n"
+    return trade_info
+
+async def handle_bot_response(event):
+    bot_message = event.raw_text.strip('"').strip()
+    try:
+        parts = bot_message.split("\n")
+        symbol, price, stop_loss_price, take_profit_price = None, None, None, None
+        for part in parts:
+            if part.startswith("Symbol:"):
+                symbol = part.replace("Symbol:", "").strip()
+            elif part.startswith("Price:"):
+                price = float(part.replace("Price:", "").strip())
+            elif part.startswith("Stop Loss:"):
+                stop_loss_price = float(part.replace("Stop Loss:", "").strip())
+            elif part.startswith("Take Profit:"):
+                take_profit_price = float(part.replace("Take Profit:", "").strip())
+
+        if not all([symbol, price, stop_loss_price, take_profit_price]):
+            raise ValueError("Missing trading parameters")
+
+        step_size = get_step_size(symbol)
+        account_balance = session.get_wallet_balance(accountType="UNIFIED")
+        wallet_list = account_balance["result"]["list"]
+        usdt_data = next((coin for acc in wallet_list for coin in acc.get("coin", []) if coin.get("coin") == "USDT"), None)
+        if not usdt_data:
+            raise ValueError("USDT balance not found")
+
+        equity = float(usdt_data.get("equity", 0))
+        wallet_balance = float(usdt_data.get("walletBalance", 0))
+
+        max_qty = math.floor((wallet_balance / price) / step_size) * step_size
+        if max_qty <= 0:
+            raise ValueError("Insufficient balance")
+
+        order = session.place_order(
+            category="linear", symbol=symbol, side="Buy", order_type="Limit",
+            qty=max_qty, price=price, time_in_force="GTC",
+            stopLoss=stop_loss_price, takeProfit=take_profit_price
+        )
+
+        if order["retCode"] == 0:
+            print(format_trade_details(symbol, price, stop_loss_price, take_profit_price, max_qty, order, equity, wallet_balance))
+        else:
+            raise ValueError(f"Order failed: {order['retMsg']}")
+
+    except Exception as e:
+        logging.error("Trade error: %s", traceback.format_exc())
+
+@client.on(events.NewMessage(from_users=BOT_USERNAME))
+async def bot_message_handler(event):
+    await handle_bot_response(event)
+
+@app.route('/otp', methods=['POST'])
+async def receive_otp():
+    global otp_received
+    try:
+        data = request.get_json()
+        otp = data.get('otp')
+        if not otp:
+            return jsonify({"error": "OTP is required"}), 400
+        otp_received = otp
+        login_event.set()
+        return jsonify({"message": "OTP received", "otp": otp}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+async def telegram_login():
+    global otp_received, last_otp_request_time
+    await client.connect()
+    if not await client.is_user_authorized():
+        if time.time() - last_otp_request_time < OTP_REQUEST_INTERVAL:
+            await asyncio.sleep(OTP_REQUEST_INTERVAL)
+        await client.send_code_request(PHONE_NUMBER)
+        last_otp_request_time = time.time()
+        await login_event.wait()
+        if otp_received:
             try:
-                await client.send_code_request(phone_number)
-                otp_request_sent[account_type] = True
-                print(f"OTP request sent successfully to {phone_number} for {account_type} account.")
-            except FloodWaitError as e:
-                print(f"Error: Too many requests for {account_type} account. Please wait {e.seconds} seconds.")
-                return False
-            except Exception as e:
-                print(f"Error sending OTP request for {account_type} account: {str(e)}\n{traceback.format_exc()}")
-                return False
-        
-        print(f"Waiting for OTP for {account_type} account...")
-        timeout = 60  # Wait up to 60 seconds for OTP
-        start_time = asyncio.get_event_loop().time()
-        while otp_data[account_type] is None:
-            if asyncio.get_event_loop().time() - start_time > timeout:
-                print(f"Timeout waiting for OTP for {account_type} account.")
-                return False
-            await asyncio.sleep(1)
-        
-        try:
-            await client.sign_in(phone_number, otp_data[account_type])
-            print(f"Login successful for {account_type} account.")
-            # Ensure session file exists after login
-            if not os.path.exists(session_file):
-                print(f"Error: Session file {session_file} not created after login.")
-                return False
-            # Upload session file after successful login
-            if upload_session_file(b2_api, bucket, session_file, remote_path):
-                print(f"Session file uploaded to B2 for {account_type} account.")
-            else:
-                print(f"Failed to upload session file for {account_type} account.")
-                return False
-            return True
-        except SessionPasswordNeededError:
-            print(f"Error: Two-factor authentication enabled for {account_type} account.")
-            return False
-        except Exception as e:
-            print(f"Error: Invalid OTP for {account_type} account: {str(e)}\n{traceback.format_exc()}")
-            otp_data[account_type] = None
-            return False
-    except Exception as e:
-        print(f"Unexpected error during login for {account_type} account: {str(e)}\n{traceback.format_exc()}")
-        return False
+                await client.sign_in(phone=PHONE_NUMBER, code=otp_received)
+            except PhoneCodeInvalidError:
+                raise ValueError("Invalid OTP")
+            except SessionPasswordNeededError:
+                raise ValueError("2FA not supported")
+            finally:
+                otp_received = None
+                login_event.clear()
 
-# === TELEGRAM EVENT HANDLER ===
-@source_client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
-async def forward_message(event):
-    message = event.raw_text
-    custom_message = f"""
-"{message}"
+async def main():
+    from threading import Thread
+    flask_thread = Thread(target=run_flask, daemon=False)
+    flask_thread.start()
+    await asyncio.sleep(2)
+    download_session_file_from_b2()
+    await telegram_login()
+    upload_session_file_to_b2()
+    await client.run_until_disconnected()
 
-If the text inside double quotes is not a trading signal or says to short/sell, reply with:
-👉 "No it's not your call"
-
-If it's a buy/long signal, extract the details and fill the form like this:
-
-Symbol: Use the coin name with 'USDT' (without '/').
-
-Price: Take the highest entry price.
-
-If it says 'buy at cmp', take the CMP given and add 10% as the price in the form.
-
-Stop Loss (SL): If given, use that.
-If not given, calculate 1.88% below the entry price.
-
-Take Profit (TP): If given, use the lowest TP price.
-If not given, calculate 2% above the entry price.
-
-🔹 Output only the filled form, no extra text.
-
-💡 Notes: 'cmp' = current market price
-           'sl' = stop loss
-           'tp' = take profit
-
-If the text says 'buy at cmp', use CMP for SL and TP as per message (or calculate if not given). But 
-always show the price in the form as 10% higher than CMP.
-"""
-    try:
-        await destination_client.send_message(DESTINATION_BOT_USERNAME, custom_message)
-        print("Message forwarded successfully to destination bot.")
-    except Exception as e:
-        print(f"Error forwarding message to destination bot: {str(e)}\n{traceback.format_exc()}")
-
-# === MAIN FUNCTION ===
-async def start_bot():
-    print(f"Starting Telegram bot at {socket.gethostbyname(socket.gethostname())}...")
-    
-    try:
-        b2_api, bucket = init_b2_client()
-        print("Backblaze B2 initialized successfully.")
-    except B2Error as e:
-        print(f"Failed to initialize Backblaze B2: {str(e)}\n{traceback.format_exc()}")
-        return
-
-    # Use session names for remote paths to maintain consistency
-    source_session_downloaded = download_session_file(b2_api, bucket, SOURCE_SESSION_FILE, f"{SOURCE_SESSION_NAME}.session")
-    destination_session_downloaded = download_session_file(b2_api, bucket, DESTINATION_SESSION_FILE, f"{DESTINATION_SESSION_NAME}.session")
-
-    source_success = await login_with_phone(
-        source_client, SOURCE_PHONE_NUMBER, 'source', b2_api, bucket, 
-        SOURCE_SESSION_FILE, f"{SOURCE_SESSION_NAME}.session"
-    )
-    if not source_success:
-        print("Failed to log in to source account. Bot cannot proceed.")
-        return
-    
-    destination_success = await login_with_phone(
-        destination_client, DESTINATION_PHONE_NUMBER, 'destination', b2_api, bucket, 
-        DESTINATION_SESSION_FILE, f"{DESTINATION_SESSION_NAME}.session"
-    )
-    if not destination_success:
-        print("Failed to log in to destination account. Bot cannot proceed.")
-        return
-    
-    # Verify both clients are fully authenticated
-    await source_client.start()
-    if not await source_client.is_user_authorized():
-        print("Source client failed post-start authorization check.")
-        return
-    await destination_client.start()
-    if not await destination_client.is_user_authorized():
-        print("Destination client failed post-start authorization check.")
-        return
-    print("Both Telegram clients are running successfully.")
-    
-    await source_client.run_until_disconnected()
-
-# === THREAD FOR FLASK ===
 def run_flask():
-    port = int(os.environ.get('PORT', 5000))
-    print(f"Starting Flask server on port {port}...")
-    app.run(host="0.0.0.0", port=port)  # Replace with Gunicorn in production
+    port = int(os.getenv("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
 
-# === RUN EVERYTHING ===
 if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    asyncio.run(start_bot())
+    asyncio.run(main())
