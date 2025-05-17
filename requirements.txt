@@ -2,3 +2,4 @@ telethon
 python-telegram-bot
 requests
 flask
+b2sdk==2.0.0
